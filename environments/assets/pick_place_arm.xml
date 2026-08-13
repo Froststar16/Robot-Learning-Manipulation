@@ -1,0 +1,177 @@
+<!--
+  pick_place_arm.xml
+  ==================
+  A 3-DOF planar arm (revolute joints about +y, moving in the x-z plane)
+  with a parallel-jaw gripper, a free-floating box, and a ground plane.
+
+  This is the contact-rich counterpart to reacher_arm.xml. Two things are
+  deliberately different from that model:
+
+  1. GRAVITY MATTERS HERE. The reach task lives in a plane where gravity is
+     mostly a nuisance; here the whole point is lifting an object against it.
+
+  2. CONTACT IS SELECTIVELY RE-ENABLED. In reacher_arm.xml all contacts are
+     off (contype="0" conaffinity="0") because arm links resting on the
+     ground plane generated friction that fought every joint motion and made
+     PPO train flat at 0% for 60k steps. That fix must NOT be blindly copied
+     here, because grasping *is* contact. Instead we use MuJoCo's contact
+     bitmask filtering so that exactly three contact pairs exist:
+
+         box  <-> floor   (the box rests on the table and can be dropped)
+         box  <-> fingertip pads (the actual grasp)
+         nothing else.
+
+     MuJoCo collides geom A and B iff:
+         (A.contype & B.conaffinity) or (B.contype & A.conaffinity)
+
+     Assignments:
+         floor   contype=1 conaffinity=1
+         box     contype=4 conaffinity=1
+         pads    contype=2 conaffinity=4
+         arm     contype=0 conaffinity=0   (collides with nothing)
+
+     Check:
+         box/floor : floor.contype(1) & box.conaff(1) = 1  -> collide
+         box/pad   : pad.conaff(4)    & box.contype(4) = 4 -> collide
+         pad/floor : 2&1=0, 1&4=0                          -> no collision
+         arm/*     : 0 either way                          -> no collision
+
+     So the arm can sweep through the table without the old friction bug,
+     while the gripper can still pick things up.
+-->
+<mujoco model="pick_place_arm">
+  <compiler angle="radian" autolimits="true"/>
+
+  <!-- Small timestep + extra solver iterations: grasping is a stiff contact
+       problem, and a sloppy solver shows up as objects squirting out of the
+       gripper. This is the single most common cause of "my grasp doesn't
+       hold" in MuJoCo. -->
+  <option timestep="0.002" gravity="0 0 -9.81" integrator="implicitfast"
+          iterations="60" ls_iterations="20" cone="elliptic"/>
+
+  <visual>
+    <headlight ambient="0.4 0.4 0.4" diffuse="0.6 0.6 0.6"/>
+    <global offwidth="640" offheight="480"/>
+  </visual>
+
+  <default>
+    <!-- Arm links: no contact at all, moderate damping so position control
+         is well behaved without needing an aggressive gain. -->
+    <default class="arm">
+      <joint type="hinge" axis="0 1 0" damping="3.0" armature="0.05"/>
+      <geom type="capsule" contype="0" conaffinity="0" density="700"
+            rgba="0.25 0.55 0.85 1"/>
+    </default>
+
+    <!-- Fingertip pads: collide only with the box. High sliding friction
+         and a soft-but-quick contact (solref) so the grasp is stable. -->
+    <default class="pad">
+      <geom type="box" contype="2" conaffinity="4"
+            friction="2.0 0.05 0.001" solref="0.004 1" solimp="0.95 0.99 0.001"
+            density="800" rgba="0.95 0.65 0.2 1"/>
+    </default>
+
+    <!-- The manipulated object. -->
+    <default class="obj">
+      <geom type="box" contype="4" conaffinity="1"
+            friction="1.0 0.05 0.001" rgba="0.85 0.25 0.30 1"/>
+    </default>
+  </default>
+
+  <worldbody>
+    <light name="top" pos="0.4 -0.5 1.5" dir="0 0.3 -1" diffuse="0.8 0.8 0.8"/>
+
+    <!-- The "table" is just the ground plane at z=0. -->
+    <geom name="floor" type="plane" size="2 2 0.05"
+          contype="1" conaffinity="1" friction="1.0 0.05 0.001"
+          rgba="0.30 0.31 0.35 1"/>
+
+    <!-- Static pillar the arm is mounted on. Purely cosmetic (no contact). -->
+    <geom name="pillar" type="capsule" fromto="0 0 0 0 0 0.45" size="0.035"
+          contype="0" conaffinity="0" rgba="0.45 0.45 0.48 1"/>
+
+    <!-- ================= ARM ================= -->
+    <body name="link1" pos="0 0 0.45" childclass="arm">
+      <joint name="joint1" range="-2.0 2.0"/>
+      <geom name="g_link1" fromto="0 0 0 0.32 0 0" size="0.028"/>
+
+      <body name="link2" pos="0.32 0 0">
+        <joint name="joint2" range="-2.6 2.6"/>
+        <geom name="g_link2" fromto="0 0 0 0.28 0 0" size="0.024"
+              rgba="0.30 0.62 0.88 1"/>
+
+        <body name="link3" pos="0.28 0 0">
+          <joint name="joint3" range="-2.2 2.2"/>
+          <geom name="g_link3" fromto="0 0 0 0.10 0 0" size="0.020"
+                rgba="0.35 0.70 0.92 1"/>
+
+          <!-- ============== GRIPPER ==============
+               Local +x is the approach direction. Fingers slide along
+               local +/-z, i.e. they close in the plane of motion. -->
+          <body name="palm" pos="0.10 0 0">
+            <geom name="g_palm" type="box" size="0.018 0.030 0.030"
+                  contype="0" conaffinity="0" rgba="0.55 0.55 0.60 1"/>
+
+            <!-- The point the controller and reward treat as "the hand".
+                 Sits between the two pads. -->
+            <site name="grip_site" pos="0.048 0 0" size="0.009"
+                  rgba="1 0.2 0.2 0.9"/>
+
+            <body name="finger_left" pos="0.018 0 0">
+              <joint name="fj_left" type="slide" axis="0 0 1"
+                     range="0 0.045" damping="8" armature="0.01"/>
+              <geom name="pad_left" class="pad" pos="0.030 0 0.026"
+                    size="0.030 0.028 0.006"/>
+            </body>
+
+            <body name="finger_right" pos="0.018 0 0">
+              <joint name="fj_right" type="slide" axis="0 0 -1"
+                     range="0 0.045" damping="8" armature="0.01"/>
+              <geom name="pad_right" class="pad" pos="0.030 0 -0.026"
+                    size="0.030 0.028 0.006"/>
+            </body>
+          </body>
+        </body>
+      </body>
+    </body>
+
+    <!-- ================= OBJECT ================= -->
+    <body name="box" pos="0.42 0 0.022">
+      <freejoint name="box_free"/>
+      <geom name="g_box" class="obj" size="0.022 0.022 0.022" mass="0.05"/>
+      <site name="box_site" pos="0 0 0" size="0.006" rgba="1 1 0 0.5"/>
+    </body>
+
+    <!-- Target location. Position is overwritten every reset from Python
+         via model.site_pos, so this is only the default. -->
+    <site name="goal" pos="0.55 0 0.25" size="0.045" type="sphere"
+          rgba="0.20 0.90 0.35 0.35"/>
+
+    <!-- Cameras. The arm works in the x-z plane, so the informative view is
+         from the side (+y looking back along -y).
+         NOTE: the primary camera is named "topdown" purely so that the
+         existing evaluation/record_gif.py, which defaults to that camera
+         name for the reach task, keeps working unchanged. It is really a
+         side view. "angled" is a nicer 3/4 view for demo GIFs. -->
+    <camera name="topdown" pos="0.40 -1.35 0.35" xyaxes="1 0 0 0 0 1"/>
+    <camera name="angled"  pos="0.95 -1.05 0.85" xyaxes="0.74 0.67 0 -0.31 0.34 0.89"/>
+  </worldbody>
+
+  <actuator>
+    <!-- Joint-level position control (a PD servo per joint) rather than raw
+         torque. Real manipulators expose exactly this interface, and it
+         makes the learning problem tractable: the policy commands *where to
+         be*, and the servo handles holding the arm up against gravity. The
+         env converts the policy's [-1,1] action into a small delta on these
+         targets, so the policy is effectively doing velocity/residual
+         control. -->
+    <position name="a_joint1" joint="joint1" kp="120" ctrlrange="-2.0 2.0" forcerange="-60 60"/>
+    <position name="a_joint2" joint="joint2" kp="90"  ctrlrange="-2.6 2.6" forcerange="-45 45"/>
+    <position name="a_joint3" joint="joint3" kp="45"  ctrlrange="-2.2 2.2" forcerange="-25 25"/>
+
+    <!-- One command drives both fingers symmetrically (the env writes the
+         same value to both), which is how a parallel-jaw gripper behaves. -->
+    <position name="a_grip_left"  joint="fj_left"  kp="250" ctrlrange="0 0.045" forcerange="-30 30"/>
+    <position name="a_grip_right" joint="fj_right" kp="250" ctrlrange="0 0.045" forcerange="-30 30"/>
+  </actuator>
+</mujoco>
