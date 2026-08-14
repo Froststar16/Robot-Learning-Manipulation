@@ -237,6 +237,8 @@ class PickPlaceEnv(gym.Env):
 
         self._step_count = 0
         self._had_grasp = False
+        self._ever_grasped = False
+        self._peak_box_z = BOX_REST_Z
         self._gave_grasp_bonus = False
         self._gave_lift_bonus = False
         self._prev_reach_pot = -self._dist_grip_box()
@@ -376,6 +378,8 @@ class PickPlaceEnv(gym.Env):
         self._prev_reach_pot = reach_pot
         self._prev_place_pot = place_pot
         self._had_grasp = grasped
+        self._ever_grasped = self._ever_grasped or grasped
+        self._peak_box_z = max(self._peak_box_z, box_z)
         return float(r), success
 
     def _info(self, reward: float) -> dict[str, Any]:
@@ -386,6 +390,12 @@ class PickPlaceEnv(gym.Env):
             "dist_box_goal": self._dist_box_goal(),
             "box_height": float(self._box_pos()[2]),
             "difficulty": self.difficulty,
+            # Diagnostics. `ever_grasped` and `peak_box_height` are what you
+            # actually watch during training: they separate "the policy cannot
+            # find the bottleneck" from "the policy grasps but cannot carry",
+            # which need completely different fixes.
+            "ever_grasped": self._ever_grasped,
+            "peak_box_height": float(self._peak_box_z),
         }
 
     # ------------------------------------------------------------------ render

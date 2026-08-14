@@ -48,8 +48,37 @@ def make_env(difficulty: float, reward_type: str, seed: int = 0):
     def _init():
         env = PickPlaceEnv(difficulty=difficulty, reward_type=reward_type)
         env.reset(seed=seed)
-        return Monitor(env, info_keywords=("is_success", "is_grasped"))
+        return Monitor(env, info_keywords=("is_success", "ever_grasped", "peak_box_height"))
     return _init
+
+
+class SaveLatestCallback(BaseCallback):
+    """Periodically overwrite a `latest_model` checkpoint.
+
+    EvalCallback already saves `best_model`, but "best" is chosen by eval
+    reward, not by recency -- so a run killed at 300k steps can leave you with
+    a checkpoint from 40k. This saves the *current* policy so `--resume` has
+    something honest to pick up from. On a laptop that sleeps, or a run you
+    stop to reclaim the CPU, this is the difference between losing an hour and
+    losing nothing.
+    """
+
+    def __init__(self, run_dir: str, every: int = 25_000, save_buffer: bool = False):
+        super().__init__(verbose=0)
+        self.run_dir, self.every, self.save_buffer = run_dir, every, save_buffer
+        self._last = 0
+
+    def _on_step(self) -> bool:
+        if self.num_timesteps - self._last < self.every:
+            return True
+        self._last = self.num_timesteps
+        self.model.save(os.path.join(self.run_dir, "latest_model"))
+        if self.save_buffer and hasattr(self.model, "save_replay_buffer"):
+            # Off-policy only, and genuinely large (hundreds of MB). Without it
+            # a resumed SAC run restarts exploration from an empty buffer.
+            self.model.save_replay_buffer(
+                os.path.join(self.run_dir, "replay_buffer.pkl"))
+        return True
 
 
 class CurriculumCallback(BaseCallback):
@@ -89,6 +118,9 @@ class CurriculumCallback(BaseCallback):
 
         if rate >= self.threshold and self.difficulty < 1.0:
             self._set(self.difficulty + self.step)
+            if getattr(self, "_diff_file", None):
+                with open(self._diff_file, "w") as f:
+                    f.write(str(self.difficulty))
             if self.verbose:
                 print(f"[curriculum] success {rate:.0%} -> "
                       f"difficulty {self.difficulty:.2f} "
@@ -106,6 +138,10 @@ def main():
     p.add_argument("--no-curriculum", action="store_true")
     p.add_argument("--n-envs", type=int, default=4)
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--resume", action="store_true",
+                   help="continue from logs/<run-name>/latest_model.zip")
+    p.add_argument("--save-buffer", action="store_true",
+                   help="also checkpoint the SAC replay buffer (large)")
     args = p.parse_args()
 
     run_dir = os.path.join("logs", args.run_name)
@@ -118,7 +154,32 @@ def main():
     ])
     eval_env = DummyVecEnv([make_env(args.difficulty, args.reward_type, 10_000)])
 
-    if args.algo == "sac":
+    start_difficulty = args.difficulty
+    ckpt = os.path.join(run_dir, "latest_model.zip")
+    diff_file = os.path.join(run_dir, "difficulty.txt")
+    if args.resume and os.path.exists(ckpt):
+        # The curriculum level is env state, not model state, so it has to be
+        # persisted separately or a resumed run silently drops back to easy.
+        if os.path.exists(diff_file):
+            start_difficulty = float(open(diff_file).read().strip())
+        train_env.env_method("set_difficulty", start_difficulty)
+        eval_env.env_method("set_difficulty", start_difficulty)
+        cls = SAC if args.algo == "sac" else PPO
+        model = cls.load(ckpt, env=train_env, tensorboard_log=run_dir)
+        buf = os.path.join(run_dir, "replay_buffer.pkl")
+        if args.algo == "sac" and os.path.exists(buf):
+            model.load_replay_buffer(buf)
+        # EvalCallback overwrites evaluations.npz on every run, so a resumed
+        # run would silently erase the earlier part of the training curve.
+        # Archive it; evaluation/plot_pick_place.py merges the segments.
+        old = os.path.join(run_dir, "evaluations.npz")
+        if os.path.exists(old):
+            i = 0
+            while os.path.exists(os.path.join(run_dir, f"evaluations_{i}.npz")):
+                i += 1
+            os.rename(old, os.path.join(run_dir, f"evaluations_{i}.npz"))
+        print(f"resumed from {ckpt} at difficulty {start_difficulty:.2f}")
+    elif args.algo == "sac":
         model = SAC(
             "MlpPolicy", train_env, verbose=1, seed=args.seed,
             learning_rate=3e-4, buffer_size=400_000, batch_size=256,
@@ -137,6 +198,7 @@ def main():
         )
 
     callbacks = [
+        SaveLatestCallback(run_dir, save_buffer=args.save_buffer),
         EvalCallback(
             eval_env, best_model_save_path=run_dir, log_path=run_dir,
             eval_freq=max(10_000 // n_envs, 1), n_eval_episodes=20,
@@ -144,10 +206,14 @@ def main():
         )
     ]
     if not args.no_curriculum:
-        callbacks.append(CurriculumCallback(train_env, eval_env))
+        cc = CurriculumCallback(train_env, eval_env)
+        cc._set(start_difficulty)
+        cc._diff_file = diff_file
+        callbacks.append(cc)
 
     model.learn(total_timesteps=args.timesteps, callback=callbacks,
-                progress_bar=False)
+                progress_bar=False, reset_num_timesteps=not args.resume)
+    model.save(os.path.join(run_dir, "latest_model"))
     model.save(os.path.join(run_dir, "final_model"))
     print(f"done. model + logs in {run_dir}")
 
