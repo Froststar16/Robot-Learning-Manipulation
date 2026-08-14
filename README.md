@@ -1,5 +1,7 @@
 # robot-learning-manipulation
 
+[![tests](https://github.com/Froststar16/Robot-Learning-Manipulation/actions/workflows/tests.yml/badge.svg)](https://github.com/Froststar16/Robot-Learning-Manipulation/actions/workflows/tests.yml)
+
 A little robot arm learns to point at things. Then it learns to pick them up.
 Both in a physics engine, both from scratch, and both taking considerably
 longer than I expected — mostly for reasons that had nothing to do with the
@@ -117,23 +119,24 @@ budget on a CPU-only run.
 
 ![Pick-and-place success rate](results/pick_place_curve.png)
 
-*PPO, 8 parallel envs, ~2.2M timesteps on a CPU. 100% success at every
-curriculum level from 0.0 to 0.75, and 95% at full randomisation over 40
-evaluation episodes. The box is still stably grasped in 25/25 successful
-episodes — which matters more than the success number, for reasons the
-debugging section explains.*
+*PPO, 8 parallel envs, ~870k timesteps on a CPU, trained from a cold start.
+100% success at every curriculum level, 40 evaluation episodes each. Verified
+by stepping through the rollout frame by frame, not just trusting the
+number — the box stays in the closed gripper from grasp to delivery, with
+no airborne moment, which is exactly the check that caught it *not* doing
+that two training attempts earlier (see Bug 3 below).*
 
-| difficulty | grasp | lift | success | mean return |
-|---|---|---|---|---|
-| 0.00 | 100% | 100% | 100% | 25.79 |
-| 0.25 | 100% | 100% | 100% | 26.22 |
-| 0.50 | 100% | 100% | 100% | 26.61 |
-| 0.75 | 100% | 100% | 100% | 26.84 |
-| 1.00 | 100% | 100% | **95%** | 26.49 |
+| difficulty | grasp | lift | success | mean return | final dist (m) |
+|---|---|---|---|---|---|
+| 0.00 | 100% | 100% | 100% | 27.74 | 0.012 |
+| 0.25 | 100% | 100% | 100% | 27.45 | 0.016 |
+| 0.50 | 100% | 100% | 100% | 27.43 | 0.020 |
+| 0.75 | 100% | 100% | 100% | 27.66 | 0.020 |
+| 1.00 | 100% | 100% | 100% | 27.94 | 0.021 |
 
 ---
 
-## The two bugs worth reading about
+## The bugs worth reading about
 
 ### Bug 1: the arm was glued to the floor
 
@@ -234,7 +237,58 @@ them and baffling if you haven't:
 what you told them to measure, and if your success condition is wrong your
 metrics will confidently agree with it.
 
-### Bug 4 (bonus): my own controller fought itself
+### Bug 4: the fix that fixed Bug 3 turned out not to be learnable
+
+Fixing Bug 3 was necessary but not sufficient. Retrained from scratch under
+the corrected success spec and the policy converged to **0% success, every
+seed, every difficulty** — with mean return pinned at 6.78 regardless of how
+easy the task was made. That flat number, identical across every difficulty
+level, was the tell: 6.78 is almost exactly the stage-1 shaping reward for
+driving straight from the home pose onto the box and stopping. `peak height`
+in the logs never left 0.022 m — box resting height. The arm was parking on
+the box and never attempting to close its fingers, and no amount of extra
+training time moved it, because it wasn't stuck — it had already converged.
+
+Two independent causes, both found by testing rather than guessing:
+
+**No reward gradient across the bottleneck.** Parking the gripper on the box
+collects the entire stage-1 shaping return at zero risk. Every action needed
+to actually grasp, lift and carry pays nothing until the whole sequence is
+completed, so from the near side of the bottleneck the far side is invisible
+to the policy gradient. The fix is a **reverse curriculum** (Florensa et al.,
+2017): a fraction of *training* episodes now start with the box already held,
+annealed to zero as the difficulty curriculum advances past 0.6. Learning the
+second half of the task first gives the first half something to be worth.
+The evaluation environment never uses this — it always starts from the real
+initial state, so the reported numbers are the real task.
+
+**The gripper action was absolute, so a stable grasp was ~0.1% likely.**
+`GRASP_HOLD_STEPS` requires several *consecutive* control steps of closed
+contact. With an absolute gripper command, holding a grasp meant sampling
+"closed" from a noisy Gaussian policy several times in a row — measured at
+well under 1%. I found this by starting *every* episode with the box already
+in the gripper and training on that alone: the policy still logged zero
+stable grasps. It was opening its fingers immediately, every episode, because
+nothing punished the single-frame flicker of contact that instant. Switched
+the gripper to residual/delta control, matching how the arm already worked —
+the commanded width now persists between steps instead of needing to be
+re-sampled correctly every 20 ms. That was the fix that actually mattered;
+the reverse curriculum sped learning up, but the delta gripper is what made
+holding a grasp something a Gaussian policy could stumble into at all.
+
+There was a third contributor worth a sentence: the finger servo's gain was
+too weak to physically counteract the box's weight even when closed correctly
+(measured directly — 14 of 15 held-box test episodes dropped it within a
+second). Raised alongside the other two fixes.
+
+**Moral:** a flat, identical return across every difficulty level is a
+different signature from noise or slow progress — it usually means the policy
+found a local optimum that doesn't scale with task difficulty because it
+never engages with the part of the task the difficulty parameter controls.
+And when a reward is right but still unlearnable, check whether the action
+space lets the policy express what the reward wants held, not just reached.
+
+### Bug 5 (bonus): my own controller fought itself
 
 The scripted controller for pick-and-place oscillated forever and never reached
 its waypoint. Cause: it was feeding back the arm's *measured* joint angles, but
@@ -258,6 +312,9 @@ pip install -r requirements.txt
 pytest tests/ -v                                   # 20 tests, ~2 seconds
 ```
 
+The same 20 tests, plus a scripted-controller sanity check, run on every push
+via GitHub Actions — that's what the badge at the top is.
+
 **Reach:**
 
 ```bash
@@ -271,12 +328,14 @@ python evaluation/evaluate.py --model-path logs/ppo_reach_v1/best_model.zip --ep
 # Sanity check first: can a hand-written controller solve it? (should print 100%)
 python scripts/scripted_pick_place.py --episodes 20 --difficulty 1.0
 
-# Train it. PPO with 8 parallel envs; ~2M steps, roughly an hour on a CPU.
-python training/train_pick_place.py --algo ppo --n-envs 8 --timesteps 2000000 --run-name ppo_pp_v1
+# Train it. PPO with 8 parallel envs; converges in under 1M steps from a
+# cold start, roughly 25-35 min on a CPU.
+python training/train_pick_place.py --algo ppo --n-envs 8 --timesteps 1000000 --run-name ppo_pp_v1
 
 # Interrupted? Same command plus --resume. Picks up from the last checkpoint
-# with the curriculum level and evaluation history intact.
-python training/train_pick_place.py --algo ppo --n-envs 8 --timesteps 2000000 --run-name ppo_pp_v1 --resume
+# with the curriculum level, the reverse-curriculum probability, and
+# evaluation history all intact.
+python training/train_pick_place.py --algo ppo --n-envs 8 --timesteps 1000000 --run-name ppo_pp_v1 --resume
 
 tensorboard --logdir logs/
 ```
@@ -295,11 +354,14 @@ low grasp is an exploration problem, high-grasp-low-lift is a contact or frictio
 problem, high-lift-low-success is a stage-2 reward problem. It prints which one
 you have.
 
-Watch `curriculum/difficulty` in tensorboard. A flat 0% for the first ~500k steps
-is **normal**, not a bug — the grasp bottleneck takes a while to find. If you're
-well past that and still at difficulty 0.0, check `rollout/ep_rew_mean`: above
-~2 means it's reaching the box but not grasping, near 0 means something is
-actually broken, and the scripted controller will tell you which.
+Watch `curriculum/difficulty` and `curriculum/grasp_init_prob` in tensorboard.
+Difficulty should start stepping up somewhere around 300-400k steps as
+`grasp_init_prob` (the fraction of training episodes that start with the box
+already held — see Bug 4 below) anneals toward zero. If `eval/mean_reward` is
+pinned at a single flat value regardless of difficulty, that specific
+signature means the policy has converged to parking on the box without
+grasping — check `evaluate_pick_place.py --sweep` for a flat return across
+every difficulty row before assuming it's still training.
 
 **Making GIFs:**
 
