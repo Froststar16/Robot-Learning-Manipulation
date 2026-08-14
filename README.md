@@ -111,13 +111,25 @@ Success rate climbs from 0% as PPO learns the task, with the usual on-policy
 noise between eval checkpoints rather than a smooth line — expected at this
 budget on a CPU-only run.
 
-**Pick-and-place:**
+**Pick-and-place — a trained policy picking the box up and delivering it:**
 
-![Scripted pick and place](results/scripted_pick.gif)
+![Trained pick-and-place policy](results/pick_place_rollout.gif)
 
-*<!-- TODO: replace with a trained-policy GIF once SAC has run, and add the
-success-rate curve. Until then this is the scripted IK controller, which is
-honest as long as it's labelled. -->*
+![Pick-and-place success rate](results/pick_place_curve.png)
+
+*PPO, 8 parallel envs, ~2.2M timesteps on a CPU. 100% success at every
+curriculum level from 0.0 to 0.75, and 95% at full randomisation over 40
+evaluation episodes. The box is still stably grasped in 25/25 successful
+episodes — which matters more than the success number, for reasons the
+debugging section explains.*
+
+| difficulty | grasp | lift | success | mean return |
+|---|---|---|---|---|
+| 0.00 | 100% | 100% | 100% | 25.79 |
+| 0.25 | 100% | 100% | 100% | 26.22 |
+| 0.50 | 100% | 100% | 100% | 26.61 |
+| 0.75 | 100% | 100% | 100% | 26.84 |
+| 1.00 | 100% | 100% | **95%** | 26.49 |
 
 ---
 
@@ -161,7 +173,68 @@ can't quietly come back.
 with the blunt version once; the second task made me learn what the setting
 actually did.
 
-### Bug 3 (bonus): my own controller fought itself
+### Bug 3: my agent learned to throw the box
+
+This is the one I'd want to talk about in an interview.
+
+Pick-and-place trained beautifully. 96% success. I ran my own evaluation
+script, which reported **97% grasp rate and 100% lift rate**. Every number said
+the policy had learned to pick things up.
+
+Then I watched the GIF.
+
+The arm wasn't picking anything up. It was **swatting the box** so that it flew
+on a ballistic arc, and the instant that arc passed within 5 cm of the goal the
+episode terminated with the success bonus. Episodes were ending in ~32 control
+steps; the hand-written controller needs about 120. The box is airborne, well
+above the arm, in half the frames.
+
+The bug was my success condition:
+
+```python
+success = np.linalg.norm(box_pos - goal) < 0.05   # position only, one instant
+terminated = success
+```
+
+Nothing in there required the box to be *stationary*, *held*, or *still there a
+moment later*. A thrown box satisfies it exactly as well as a placed one — and
+throwing is far easier to stumble into than grasping, so that is what
+reinforcement learning found. This is **specification gaming**: the policy
+maximised precisely what I asked for, and what I asked for was not what I
+meant.
+
+The part that stings is that my own diagnostics confirmed the hack instead of
+catching it. `is_grasped()` fired on a single frame of pad contact, which a
+swat produces. `peak_box_height` counted any height at all, which a launched
+box trivially clears. I built the instruments and then trusted them without
+ever watching a rollout.
+
+**The fix.** Success is now *settled at the goal*: the box must have been
+genuinely grasped, be within 5 cm, and be moving under 0.30 m/s — held for five
+consecutive steps. A thrown object cannot satisfy that; a held one does so
+trivially. Re-scoring the old policy under the corrected spec gives **0%**,
+which confirms the diagnosis rather than merely asserting it.
+
+Two further problems surfaced while retraining, both ordinary once you've seen
+them and baffling if you haven't:
+
+- **The curriculum stopped advancing.** It was gated on the *stochastic
+  training* success rate, which sat at 0% while the *deterministic eval* policy
+  was already at 50% — holding still for several steps is nearly impossible
+  under exploration noise. A curriculum gated on the wrong signal silently
+  spends the whole budget on the easiest level. Now gated on eval.
+- **The terminal bonus was unreachable.** With a ten-step hold requirement the
+  policy reached 19.8 mean return (the scripted controller gets 21.4) at **0%
+  success** — carrying the box to the goal perfectly and then hovering there
+  forever, because it never once experienced the +10 and so never learned that
+  settling was a thing worth doing. Fixed by shortening the hold and adding a
+  small per-step bonus while settled, turning a cliff into a gradient.
+
+**Moral:** watch a rollout before you trust a number. Aggregate metrics measure
+what you told them to measure, and if your success condition is wrong your
+metrics will confidently agree with it.
+
+### Bug 4 (bonus): my own controller fought itself
 
 The scripted controller for pick-and-place oscillated forever and never reached
 its waypoint. Cause: it was feeding back the arm's *measured* joint angles, but
@@ -198,14 +271,35 @@ python evaluation/evaluate.py --model-path logs/ppo_reach_v1/best_model.zip --ep
 # Sanity check first: can a hand-written controller solve it? (should print 100%)
 python scripts/scripted_pick_place.py --episodes 20 --difficulty 1.0
 
-# Train it. SAC by default -- expect 45-90 min for 150k steps on CPU.
-python training/train_pick_place.py --timesteps 150000 --run-name sac_pp_v1
+# Train it. PPO with 8 parallel envs; ~2M steps, roughly an hour on a CPU.
+python training/train_pick_place.py --algo ppo --n-envs 8 --timesteps 2000000 --run-name ppo_pp_v1
+
+# Interrupted? Same command plus --resume. Picks up from the last checkpoint
+# with the curriculum level and evaluation history intact.
+python training/train_pick_place.py --algo ppo --n-envs 8 --timesteps 2000000 --run-name ppo_pp_v1 --resume
+
 tensorboard --logdir logs/
 ```
 
-Watch `curriculum/difficulty` in tensorboard. If it never leaves 0.0, the policy
-isn't grasping yet — check `rollout/ep_rew_mean` is above ~2 first, which means
-it's at least learning to reach the box.
+Then measure it:
+
+```bash
+python evaluation/evaluate_pick_place.py --model-path logs/ppo_pp_v1/best_model.zip --sweep
+python evaluation/plot_pick_place.py --run-dir logs/ppo_pp_v1 --out results/pick_place_curve.png
+python evaluation/record_pick_place_gif.py --model-path logs/ppo_pp_v1/best_model.zip
+```
+
+`evaluate_pick_place.py` reports **grasp, lift and success separately**, because
+"45% success" is not a diagnosis. The gaps between the three localise the fault:
+low grasp is an exploration problem, high-grasp-low-lift is a contact or friction
+problem, high-lift-low-success is a stage-2 reward problem. It prints which one
+you have.
+
+Watch `curriculum/difficulty` in tensorboard. A flat 0% for the first ~500k steps
+is **normal**, not a bug — the grasp bottleneck takes a while to find. If you're
+well past that and still at difficulty 0.0, check `rollout/ep_rew_mean`: above
+~2 means it's reaching the box but not grasping, near 0 means something is
+actually broken, and the scripted controller will tell you which.
 
 **Making GIFs:**
 
@@ -224,6 +318,16 @@ MUJOCO_GL=osmesa python evaluation/record_gif.py --out results/demo_rollout.gif
 ---
 
 ## A few design decisions, and why
+
+**PPO over SAC, decided by measurement rather than theory.** I originally
+defaulted to SAC on a sample-efficiency argument: pick-and-place has a narrow
+success funnel, so replaying each rare grasp many times should beat throwing
+every batch away after one gradient step. The argument is correct and it turned
+out not to matter. Measured throughput on this environment: **SAC ~60 fps, PPO
+with 8 parallel envs ~780 fps** — one gradient step per environment step
+dominates everything else on a CPU. There is no sample budget here, there is a
+wall-clock budget, and SAC would need to be 13x more sample-efficient to break
+even. It isn't. Both remain available via `--algo`.
 
 **Position control with gravity compensation, not raw torques.** Under torque
 control the policy has to learn to hold the arm up against gravity before it
@@ -271,6 +375,9 @@ scripts/
 evaluation/
   evaluate.py
   record_gif.py
+  evaluate_pick_place.py    # grasp / lift / success breakdown, not one number
+  plot_pick_place.py        # success curve annotated with curriculum steps
+  record_pick_place_gif.py
 domain_randomization/
   randomize.py
 tests/
@@ -293,7 +400,7 @@ results/
 | 3 | Manipulation: pick-and-place | done |
 | 4 | Robustness: domain randomization | done (reach) |
 | 5 | Imitation learning comparison | next |
-| 6 | Evaluation, visualization & docs | done (reach), in progress (pick-place) |
+| 6 | Evaluation, visualization & docs | done |
 
 **Phase 5** is the interesting one and it's now unblocked, because the scripted
 controller can generate demonstrations (`--save-demos`). The plan is behaviour
@@ -320,7 +427,8 @@ And what is *not* simplified: the contact dynamics are real, the grasp is real
 friction rather than a weld constraint, and the box can genuinely be dropped. A
 common shortcut in tutorial pick-and-place environments is to glue the object
 to the gripper with an equality constraint once the fingers get close enough.
-That isn't done here.
+That isn't done here — which is exactly why the policy was able to throw the
+box, and why catching that was worth the trouble.
 
 ---
 
