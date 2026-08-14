@@ -171,7 +171,7 @@
 
     <!-- One command drives both fingers symmetrically (the env writes the
          same value to both), which is how a parallel-jaw gripper behaves. -->
-    <position name="a_grip_left"  joint="fj_left"  kp="250" ctrlrange="0 0.045" forcerange="-30 30"/>
-    <position name="a_grip_right" joint="fj_right" kp="250" ctrlrange="0 0.045" forcerange="-30 30"/>
+    <position name="a_grip_left"  joint="fj_left"  kp="800" ctrlrange="0 0.045" forcerange="-60 60"/>
+    <position name="a_grip_right" joint="fj_right" kp="800" ctrlrange="0 0.045" forcerange="-60 60"/>
   </actuator>
 </mujoco>

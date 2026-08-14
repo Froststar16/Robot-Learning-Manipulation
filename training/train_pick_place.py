@@ -44,11 +44,13 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from environments.pick_place_env import PickPlaceEnv  # noqa: E402
 
 
-def make_env(difficulty: float, reward_type: str, seed: int = 0):
+def make_env(difficulty: float, reward_type: str, seed: int = 0,
+             grasp_init_prob: float = 0.0):
     def _init():
-        env = PickPlaceEnv(difficulty=difficulty, reward_type=reward_type)
+        env = PickPlaceEnv(difficulty=difficulty, reward_type=reward_type,
+                           grasp_init_prob=grasp_init_prob)
         env.reset(seed=seed)
-        return Monitor(env, info_keywords=("is_success", "ever_grasped", "peak_box_height"))
+        return Monitor(env, info_keywords=("is_success", "ever_grasped", "peak_carry_height"))
     return _init
 
 
@@ -89,32 +91,60 @@ class CurriculumCallback(BaseCallback):
     than recomputing it, so it costs nothing.
     """
 
-    def __init__(self, train_env, eval_env, threshold=0.6, step=0.2,
-                 window=30, check_every=5000, verbose=1):
+    def __init__(self, train_env, eval_env, eval_callback=None, threshold=0.6,
+                 step=0.2, window=30, check_every=5000, grasp_init_start=0.7,
+                 verbose=1):
         super().__init__(verbose)
         self.train_env, self.eval_env = train_env, eval_env
+        self.eval_callback = eval_callback
         self.threshold, self.step, self.window = threshold, step, window
         self.check_every = check_every
         self._last_check = 0
         self.difficulty = 0.0
+        self.grasp_init_start = grasp_init_start
+        self.grasp_init_prob = grasp_init_start
 
     def _set(self, d: float):
         self.difficulty = float(np.clip(d, 0.0, 1.0))
         for venv in (self.train_env, self.eval_env):
             venv.env_method("set_difficulty", self.difficulty)
+        # Reverse curriculum, annealed to zero as the task gets harder. The
+        # TRAINING env alone gets grasped start states; the eval env always
+        # measures the real task from the real initial state.
+        p = max(0.0, self.grasp_init_start * (1.0 - self.difficulty / 0.6))
+        self.train_env.env_method("set_grasp_init_prob", p)
+        self.grasp_init_prob = p
 
     def _on_step(self) -> bool:
         if self.num_timesteps - self._last_check < self.check_every:
             return True
         self._last_check = self.num_timesteps
 
-        buf = self.model.ep_info_buffer
-        if not buf or len(buf) < self.window:
-            return True
-        recent = list(buf)[-self.window:]
-        rate = float(np.mean([ep.get("is_success", 0.0) for ep in recent]))
+        # Prefer the *deterministic* eval success rate over the training
+        # rollout buffer.
+        #
+        # Once success requires holding the box still at the goal for ten
+        # consecutive steps, exploration noise makes that nearly impossible:
+        # the stochastic training policy scored 0% while the deterministic
+        # policy was already at ~50%. A curriculum gated on the training
+        # buffer therefore never advances, and the run silently spends its
+        # whole budget on difficulty 0. Gate on what the policy can actually
+        # do, not on what it does while exploring.
+        rate = None
+        ev = self.eval_callback
+        if ev is not None:
+            sb = getattr(ev, "_is_success_buffer", None)
+            if sb:
+                rate = float(np.mean(sb))
+        if rate is None:
+            buf = self.model.ep_info_buffer
+            if not buf or len(buf) < self.window:
+                return True
+            recent = list(buf)[-self.window:]
+            rate = float(np.mean([ep.get("is_success", 0.0) for ep in recent]))
         self.logger.record("curriculum/success_rate", rate)
         self.logger.record("curriculum/difficulty", self.difficulty)
+        self.logger.record("curriculum/grasp_init_prob", self.grasp_init_prob)
 
         if rate >= self.threshold and self.difficulty < 1.0:
             self._set(self.difficulty + self.step)
@@ -136,6 +166,10 @@ def main():
     p.add_argument("--reward-type", choices=["dense", "sparse"], default="dense")
     p.add_argument("--difficulty", type=float, default=0.0)
     p.add_argument("--no-curriculum", action="store_true")
+    p.add_argument("--grasp-init", type=float, default=0.7,
+                   help="initial fraction of TRAINING episodes that start with "
+                        "the box already held (reverse curriculum); annealed "
+                        "to 0 by difficulty 0.6. Eval always starts normally.")
     p.add_argument("--n-envs", type=int, default=4)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--resume", action="store_true",
@@ -149,7 +183,8 @@ def main():
 
     n_envs = 1 if args.algo == "sac" else args.n_envs
     train_env = DummyVecEnv([
-        make_env(args.difficulty, args.reward_type, args.seed + i)
+        make_env(args.difficulty, args.reward_type, args.seed + i,
+                 grasp_init_prob=0.0 if args.no_curriculum else args.grasp_init)
         for i in range(n_envs)
     ])
     eval_env = DummyVecEnv([make_env(args.difficulty, args.reward_type, 10_000)])
@@ -197,16 +232,15 @@ def main():
             tensorboard_log=run_dir,
         )
 
-    callbacks = [
-        SaveLatestCallback(run_dir, save_buffer=args.save_buffer),
-        EvalCallback(
-            eval_env, best_model_save_path=run_dir, log_path=run_dir,
-            eval_freq=max(10_000 // n_envs, 1), n_eval_episodes=20,
-            deterministic=True, render=False,
-        )
-    ]
+    eval_cb = EvalCallback(
+        eval_env, best_model_save_path=run_dir, log_path=run_dir,
+        eval_freq=max(10_000 // n_envs, 1), n_eval_episodes=20,
+        deterministic=True, render=False,
+    )
+    callbacks = [SaveLatestCallback(run_dir, save_buffer=args.save_buffer), eval_cb]
     if not args.no_curriculum:
-        cc = CurriculumCallback(train_env, eval_env)
+        cc = CurriculumCallback(train_env, eval_env, eval_callback=eval_cb,
+                                grasp_init_start=args.grasp_init)
         cc._set(start_difficulty)
         cc._diff_file = diff_file
         callbacks.append(cc)

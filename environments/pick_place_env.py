@@ -64,6 +64,16 @@ SUCCESS_RADIUS = 0.05
 BOX_REST_Z = 0.022
 # Considered "lifted" above this height.
 LIFT_Z = 0.075
+# A grasp only counts once both pads have been in contact this many
+# consecutive control steps. A single frame of contact is what a *swat*
+# produces, not a grasp.
+GRASP_HOLD_STEPS = 3
+# The box must sit at the goal, slow, for this many consecutive control steps
+# before the episode is a success.
+SUCCESS_HOLD_STEPS = 5
+# ...and "slow" means this, in m/s. A thrown box passing through the goal is
+# moving an order of magnitude faster than a placed one.
+SUCCESS_MAX_SPEED = 0.30
 
 
 # --------------------------------------------------------------------------
@@ -128,6 +138,7 @@ class PickPlaceEnv(gym.Env):
         max_episode_steps: int = 250,
         frame_skip: int = 10,
         difficulty: float = 0.0,
+        grasp_init_prob: float = 0.0,
         reward_type: str = "dense",
         gravity_compensation: bool = True,
         camera: str = "topdown",
@@ -146,6 +157,7 @@ class PickPlaceEnv(gym.Env):
         self.reward_type = reward_type
         self.gravity_compensation = gravity_compensation
         self.difficulty = float(np.clip(difficulty, 0.0, 1.0))
+        self.grasp_init_prob = float(np.clip(grasp_init_prob, 0.0, 1.0))
 
         self.render_mode = render_mode
         self._camera = camera
@@ -183,6 +195,20 @@ class PickPlaceEnv(gym.Env):
         self.grip_open = float(self.model.jnt_range[3, 1])        # 0.045
         self.grip_closed = float(self.model.jnt_range[3, 0])      # 0.0
         self.delta_max = 0.08  # rad of servo-target change per control step
+        # The gripper is also delta-controlled, for the same reason the arm is
+        # -- but here it is what makes grasping *learnable at all*.
+        #
+        # With an absolute command, holding a grasp means sampling "closed" on
+        # GRASP_HOLD_STEPS consecutive steps; under a Gaussian policy with
+        # std ~0.5 that is well under 1% likely, so a stable grasp is almost
+        # never experienced and never reinforced. Measured: with every episode
+        # starting with the box already in the gripper, a policy trained this
+        # way still registered zero stable grasps -- it opened its fingers
+        # immediately, every time.
+        #
+        # With a delta command the gripper *stays where it is put*, so noise
+        # averages out instead of having to come up heads five times running.
+        self.grip_delta = 0.012
 
         # ---- spaces
         self.action_space = spaces.Box(-1.0, 1.0, shape=(4,), dtype=np.float32)
@@ -203,6 +229,67 @@ class PickPlaceEnv(gym.Env):
     def set_difficulty(self, difficulty: float) -> None:
         """Curriculum hook. 0 = easiest, 1 = full randomisation."""
         self.difficulty = float(np.clip(difficulty, 0.0, 1.0))
+
+    def set_grasp_init_prob(self, p: float) -> None:
+        """Start-state (reverse) curriculum hook.
+
+        Fraction of episodes that begin with the box *already held*. See the
+        long note in `_reset_grasped`. Set this on the TRAINING env only --
+        an evaluation env must always start from the true initial state or
+        the reported success rate is measuring an easier task than the one
+        being claimed.
+        """
+        self.grasp_init_prob = float(np.clip(p, 0.0, 1.0))
+
+    def _reset_grasped(self) -> None:
+        """Initialise the episode with the box already in the gripper.
+
+        This is a *reverse curriculum* (Florensa et al., 2017): rather than
+        always starting from the true initial state and hoping exploration
+        stumbles into the bottleneck, some episodes start on the far side of
+        it and learn the second half of the task first.
+
+        It exists because the task is not learnable from scratch without it.
+        Trained cold, PPO reliably converges to a local optimum where the
+        gripper drives onto the box and parks: that collects the entire stage-1
+        shaping return (~6.8 of a possible ~26) with no risk, and the sequence
+        of actions needed to close the fingers, hold, and lift earns nothing
+        until it is completed. The reward signal on the far side of the
+        bottleneck is invisible from this side.
+
+        Starting some episodes already holding the box makes the stage-2 reward
+        reachable immediately. Once carrying is learned, its value propagates
+        backwards and gives grasping something to be worth. The probability is
+        annealed to zero as the curriculum advances, so the final policy is
+        evaluated -- and trained -- entirely on true start states.
+        """
+        d = self.difficulty
+        box_x = self.np_random.uniform(0.40 - 0.03 - 0.07 * d,
+                                       0.40 + 0.03 + 0.07 * d)
+        carry_z = float(self.np_random.uniform(0.12, 0.28))
+
+        q = analytic_ik_3link(
+            box_x, carry_z, l1=self.l1, l2=self.l2, le=self.le,
+            base_x=self.base_xz[0], base_z=self.base_xz[1],
+            approach=-np.pi / 2, elbow_up=True,
+        )
+        if q is None:  # unreachable sample; fall back to a normal start
+            return
+
+        self.data.qpos[:3] = q
+        # Fingers just barely around the box (half-width 0.022, pad inner face
+        # sits at 0.020 + joint value), with the servo commanded fully closed
+        # so it squeezes rather than merely resting in contact.
+        self.data.qpos[3:5] = 0.002
+        self._ctrl[:3] = q
+        self._ctrl[3:] = self.grip_closed
+
+        qa = int(self._box_qadr)
+        self.data.qpos[qa + 0] = box_x
+        self.data.qpos[qa + 1] = 0.0
+        self.data.qpos[qa + 2] = carry_z
+        self.data.qpos[qa + 3:qa + 7] = [1, 0, 0, 0]
+        self.data.qvel[:] = 0.0
 
     def reset(self, *, seed=None, options=None):
         super().reset(seed=seed)
@@ -230,19 +317,25 @@ class PickPlaceEnv(gym.Env):
         goal_z = float(self.np_random.uniform(0.14 - 0.04 * d, 0.18 + 0.16 * d))
         self.model.site_pos[self._sid_goal] = [goal_x, 0.0, goal_z]
 
+        if self.np_random.random() < self.grasp_init_prob:
+            self._reset_grasped()
+
         mujoco.mj_forward(self.model, self.data)
-        # Let the box settle onto the floor before the episode starts.
+        # Let the box settle (onto the floor, or into the gripper) first.
         for _ in range(20):
             self._physics_step()
 
         self._step_count = 0
         self._had_grasp = False
+        self._grasp_streak = 0
+        self._success_streak = 0
         self._ever_grasped = False
         self._peak_box_z = BOX_REST_Z
         self._gave_grasp_bonus = False
         self._gave_lift_bonus = False
         self._prev_reach_pot = -self._dist_grip_box()
         self._prev_place_pot = -self._dist_box_goal()
+        self._prev_gap = float(np.mean(self.data.qpos[3:5]))
 
         return self._get_obs(), self._info(0.0)
 
@@ -255,10 +348,12 @@ class PickPlaceEnv(gym.Env):
             self.arm_range[:, 0],
             self.arm_range[:, 1],
         )
-        # Gripper: absolute command, so the policy can commit to closing.
-        grip_cmd = self.grip_closed + (action[3] + 1.0) * 0.5 * (
-            self.grip_open - self.grip_closed
-        )
+        # Gripper: residual command. Positive opens, negative closes, and the
+        # commanded width persists between steps.
+        grip_cmd = float(np.clip(
+            self._ctrl[3] + action[3] * self.grip_delta,
+            self.grip_closed, self.grip_open,
+        ))
         self._ctrl[3:] = grip_cmd
 
         self.data.ctrl[:] = self._ctrl
@@ -315,6 +410,21 @@ class PickPlaceEnv(gym.Env):
                     right = True
         return left and right
 
+    def _box_speed(self) -> float:
+        va = int(self._box_vadr)
+        return float(np.linalg.norm(self.data.qvel[va:va + 3]))
+
+    def has_stable_grasp(self) -> bool:
+        """Both pads in contact for GRASP_HOLD_STEPS consecutive steps.
+
+        The instantaneous version (`is_grasped`) is not enough: batting the
+        box across the table registers a frame or two of pad contact, so a
+        policy that never grasps anything can still collect a grasp bonus and
+        look healthy in the metrics. Requiring persistence is what separates
+        holding from hitting.
+        """
+        return self._grasp_streak >= GRASP_HOLD_STEPS
+
     def _get_obs(self) -> np.ndarray:
         qa = int(self._box_qadr)
         va = int(self._box_vadr)
@@ -342,22 +452,41 @@ class PickPlaceEnv(gym.Env):
     # ------------------------------------------------------------------ reward
     def _reward(self, action: np.ndarray):
         d_place = self._dist_box_goal()
-        success = d_place < SUCCESS_RADIUS
+        at_goal = d_place < SUCCESS_RADIUS
+        speed = self._box_speed()
+
+        # Success is *settled at the goal*, not *momentarily at the goal*.
+        #
+        # The first version of this env used `d_place < SUCCESS_RADIUS` alone
+        # and terminated on it. PPO found the obvious exploit: swat the box so
+        # it flies on a ballistic arc through the goal point, collect +10 the
+        # instant the arc clips the sphere, end the episode in ~32 steps. It
+        # scored ~96% "success" without ever picking anything up.
+        #
+        # Three conditions now have to hold together, and hold for a fifth of
+        # a second, which a thrown object cannot do.
+        # `_ever_grasped` is part of the criterion so that knocking the box
+        # to the goal can never count, however gently it lands.
+        settled = at_goal and speed < SUCCESS_MAX_SPEED and self._ever_grasped
+        self._success_streak = self._success_streak + 1 if settled else 0
+        success = self._success_streak >= SUCCESS_HOLD_STEPS
 
         if self.reward_type == "sparse":
-            # Goal-conditioned convention that HER expects: 0 on success,
-            # -1 otherwise. Kept as an explicit comparison point against the
-            # shaped reward below.
             return (0.0 if success else -1.0), success
 
-        grasped = self.is_grasped()
+        # Instantaneous contact -> persistent grasp.
+        self._grasp_streak = self._grasp_streak + 1 if self.is_grasped() else 0
+        grasped = self.has_stable_grasp()
+
         box_z = self._box_pos()[2]
         reach_pot = -self._dist_grip_box()
         place_pot = -d_place
 
         r = 0.0
         if grasped:
-            # Stage 2: only carry progress counts.
+            # Stage 2 shaping is gated on a *stable* grasp, so a box flying
+            # toward the goal earns nothing -- the shaping cannot be collected
+            # ballistically.
             r += 20.0 * (place_pot - self._prev_place_pot)
             if not self._gave_grasp_bonus:
                 r += 2.0
@@ -365,11 +494,36 @@ class PickPlaceEnv(gym.Env):
             if not self._gave_lift_bonus and box_z > LIFT_Z:
                 r += 3.0
                 self._gave_lift_bonus = True
+            self._peak_box_z = max(self._peak_box_z, box_z)
+            self._ever_grasped = True
         else:
-            # Stage 1: only approach progress counts.
             r += 10.0 * (reach_pot - self._prev_reach_pot)
             if self._had_grasp and box_z < LIFT_Z:
                 r -= 1.0  # dropped it
+            # Closing the fingers while lined up on the box earns a little,
+            # so that the first half of a grasp is not completely unrewarded.
+            # Potential-based on finger opening, and deliberately small: it is
+            # a nudge out of the "park next to the box" local optimum, not a
+            # reason to sit there opening and closing.
+            gap = float(np.mean(self.data.qpos[3:5]))
+            if self._dist_grip_box() < 0.045:
+                r += 2.0 * (self._prev_gap - gap)
+            self._prev_gap = gap
+
+        # Explicitly discourage launching the object. Without a stable grasp
+        # there is no legitimate reason for the box to be moving fast.
+        if not grasped and speed > 0.5:
+            r -= 0.05 * (speed - 0.5)
+
+        # Per-step bonus for being settled at the goal *before* the hold is
+        # complete. Without it the terminal bonus is unreachable: holding
+        # still for several consecutive steps is nearly impossible under
+        # exploration noise, so the policy never experiences the +10 and never
+        # learns to settle. It reached the goal with 96% of the scripted
+        # controller's return and 0% success -- carrying perfectly, hovering
+        # forever. This term gives settling a gradient rather than a cliff.
+        if settled:
+            r += 0.5
 
         r -= 0.005 * float(np.sum(np.square(action)))
         if success:
@@ -378,14 +532,16 @@ class PickPlaceEnv(gym.Env):
         self._prev_reach_pot = reach_pot
         self._prev_place_pot = place_pot
         self._had_grasp = grasped
-        self._ever_grasped = self._ever_grasped or grasped
-        self._peak_box_z = max(self._peak_box_z, box_z)
         return float(r), success
 
     def _info(self, reward: float) -> dict[str, Any]:
         return {
-            "is_success": self._dist_box_goal() < SUCCESS_RADIUS,
-            "is_grasped": self.is_grasped(),
+            "is_success": self._success_streak >= SUCCESS_HOLD_STEPS,
+            # Position-only check, kept separate so the throwing exploit stays
+            # *visible* in the logs rather than silently counted as success.
+            "at_goal": self._dist_box_goal() < SUCCESS_RADIUS,
+            "box_speed": self._box_speed(),
+            "is_grasped": self.has_stable_grasp(),
             "dist_grip_box": self._dist_grip_box(),
             "dist_box_goal": self._dist_box_goal(),
             "box_height": float(self._box_pos()[2]),
@@ -395,7 +551,9 @@ class PickPlaceEnv(gym.Env):
             # find the bottleneck" from "the policy grasps but cannot carry",
             # which need completely different fixes.
             "ever_grasped": self._ever_grasped,
-            "peak_box_height": float(self._peak_box_z),
+            # Peak height *while stably grasped*. A launched box reaches a
+            # great height without this ever leaving its resting value.
+            "peak_carry_height": float(self._peak_box_z),
         }
 
     # ------------------------------------------------------------------ render
