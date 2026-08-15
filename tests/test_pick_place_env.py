@@ -27,6 +27,7 @@ from environments.pick_place_env import (  # noqa: E402
     PickPlaceEnv,
     analytic_ik_3link,
     SUCCESS_RADIUS,
+    LIFT_Z,
 )
 from scripts.scripted_pick_place import ScriptedPickPlace  # noqa: E402
 
@@ -181,3 +182,132 @@ def test_success_requires_the_box_not_the_gripper(env):
         mujoco.mj_forward(env.model, env.data)
         assert np.linalg.norm(env._grip_pos() - goal) < SUCCESS_RADIUS
         assert not env._info(0.0)["is_success"]
+
+
+# ---------------------------------------------------------------------------
+# Sparse reward-mode parity
+#
+# reward_type="sparse" could previously never report success: the grasp/
+# success bookkeeping (_ever_grasped, _grasp_streak, _peak_box_z) lived
+# inside the dense branch of _reward(), below the early return for sparse
+# mode, so it was never updated when reward_type="sparse". Sparse mode
+# returned a constant -1, never terminated, and every info-dict diagnostic
+# tied to grasping was permanently dead. The fix pulls that bookkeeping into
+# _update_task_state(), which now runs before the reward-mode branch.
+#
+# The invariant these protect: task state -- what actually happened in the
+# episode -- must not depend on which reward function is scoring it.
+# ---------------------------------------------------------------------------
+
+# info keys that are physics-derived and must match between reward modes.
+TASK_STATE_KEYS = [
+    "is_success",
+    "at_goal",
+    "box_speed",
+    "is_grasped",
+    "dist_grip_box",
+    "dist_box_goal",
+    "box_height",
+    "ever_grasped",
+    "peak_carry_height",
+]
+
+
+def _rollout(reward_type, actions, seed, **kwargs):
+    """Step a fresh env through a fixed action sequence, recording task state."""
+    e = PickPlaceEnv(reward_type=reward_type, **kwargs)
+    _, info = e.reset(seed=seed)
+    trace = [{k: info[k] for k in TASK_STATE_KEYS}]
+    rewards = []
+    for a in actions:
+        _, r, terminated, truncated, info = e.step(a)
+        trace.append({k: info[k] for k in TASK_STATE_KEYS})
+        rewards.append(r)
+        if terminated or truncated:
+            break
+    e.close()
+    return trace, rewards
+
+
+def test_task_state_is_independent_of_reward_type():
+    """Dense and sparse envs must agree on every physics-derived quantity.
+
+    grasp_init_prob=1.0 is load-bearing: with random actions from the true
+    start state the box is never grasped, so is_grasped/ever_grasped would
+    be False in both modes and the bug would slip through undetected.
+    Forcing a pre-placed grasp is what makes the two traces diverge under
+    the old code.
+    """
+    rng = np.random.default_rng(0)
+    actions = rng.uniform(-1.0, 1.0, size=(60, 4)).astype(np.float32)
+
+    dense, _ = _rollout("dense", actions, seed=0, grasp_init_prob=1.0)
+    sparse, _ = _rollout("sparse", actions, seed=0, grasp_init_prob=1.0)
+
+    assert len(dense) == len(sparse), (
+        "episodes ended at different steps -- termination must not depend "
+        "on the reward mode"
+    )
+    for step, (d, s) in enumerate(zip(dense, sparse)):
+        for key in TASK_STATE_KEYS:
+            assert d[key] == pytest.approx(s[key]), (
+                f"info[{key!r}] diverged at step {step}: "
+                f"dense={d[key]} sparse={s[key]}"
+            )
+
+
+def test_sparse_mode_tracks_grasp_state():
+    """Narrow regression: ever_grasped must update in sparse mode.
+
+    Under the old code this stayed False for the entire episode regardless
+    of what the arm did, which is the one fact that made sparse success
+    unreachable.
+    """
+    rng = np.random.default_rng(1)
+    actions = (0.2 * rng.uniform(-1.0, 1.0, size=(30, 4))).astype(np.float32)
+
+    trace, _ = _rollout("sparse", actions, seed=0, grasp_init_prob=1.0)
+
+    assert any(s["is_grasped"] for s in trace), (
+        "no stable grasp registered in sparse mode despite starting "
+        "pre-grasped"
+    )
+    assert trace[-1]["ever_grasped"]
+    assert trace[-1]["peak_carry_height"] > LIFT_Z
+
+
+def test_sparse_reward_is_bounded_and_terminal_is_zero():
+    """Sparse reward takes only {-1, 0}, and 0 iff success.
+
+    Guards the SB3/HER convention: a stray shaping term leaking into the
+    sparse path would silently break goal relabelling later, so this is
+    checked at the source rather than discovered as a confusing HER result.
+    """
+    rng = np.random.default_rng(2)
+    actions = rng.uniform(-1.0, 1.0, size=(40, 4)).astype(np.float32)
+
+    trace, rewards = _rollout("sparse", actions, seed=0, grasp_init_prob=1.0)
+
+    assert set(np.round(rewards, 12)).issubset({-1.0, 0.0})
+    for r, s in zip(rewards, trace[1:]):
+        assert (r == 0.0) == s["is_success"]
+
+
+def test_sparse_task_is_solvable_end_to_end():
+    """Strong guard: the scripted controller must succeed under sparse
+    reward, not just agree with dense mode on paper. Parity proves the two
+    modes agree; this proves the thing they agree on is reachable."""
+    e = PickPlaceEnv(reward_type="sparse", difficulty=0.0)
+    obs, info = e.reset(seed=0)
+    ctrl = ScriptedPickPlace(e)
+
+    reward = None
+    for _ in range(e.max_episode_steps):
+        obs, reward, term, trunc, info = e.step(ctrl.act(obs))
+        if term or trunc:
+            break
+
+    assert info["is_success"], "scripted controller failed under sparse reward"
+    assert reward == 0.0
+    assert info["ever_grasped"]
+    e.close()
