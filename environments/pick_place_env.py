@@ -224,6 +224,14 @@ class PickPlaceEnv(gym.Env):
         self._had_grasp = False
         self._gave_grasp_bonus = False
         self._gave_lift_bonus = False
+        # Episode state. `reset()` is the real initialiser for these -- they
+        # are declared here only so that touching the env before its first
+        # reset raises a Gym-shaped error rather than an AttributeError.
+        self._grasp_streak = 0
+        self._success_streak = 0
+        self._ever_grasped = False
+        self._peak_box_z = BOX_REST_Z
+        self._prev_gap = 0.0
 
     # ------------------------------------------------------------------ core
     def set_difficulty(self, difficulty: float) -> None:
@@ -450,10 +458,32 @@ class PickPlaceEnv(gym.Env):
         return obs.astype(np.float32)
 
     # ------------------------------------------------------------------ reward
-    def _reward(self, action: np.ndarray):
-        d_place = self._dist_box_goal()
-        at_goal = d_place < SUCCESS_RADIUS
-        speed = self._box_speed()
+    def _update_task_state(self) -> tuple[bool, bool]:
+        """Advance grasp/success bookkeeping. Runs in *every* reward mode.
+
+        This used to live inside the dense branch of `_reward`, below the
+        early return for sparse mode. The consequence was that with
+        `reward_type="sparse"`, `_ever_grasped` was never set -- and since
+        `settled` requires it, success could never fire. Sparse mode returned
+        a constant -1 forever, never terminated, and reported dead
+        diagnostics (`is_grasped`, `ever_grasped`, `peak_carry_height`) in
+        `info`. Every sparse experiment would have silently measured nothing.
+
+        The underlying mistake was categorical: *what happened in the episode*
+        is a property of the episode, not of the reward function chosen to
+        score it. Separating the two here makes that structural rather than
+        something to remember, which is what keeps the bug from coming back
+        the next time this method is edited.
+
+        Returns `(grasped, settled)`.
+        """
+        # Instantaneous contact -> persistent grasp.
+        self._grasp_streak = self._grasp_streak + 1 if self.is_grasped() else 0
+        grasped = self.has_stable_grasp()
+
+        if grasped:
+            self._ever_grasped = True
+            self._peak_box_z = max(self._peak_box_z, self._box_pos()[2])
 
         # Success is *settled at the goal*, not *momentarily at the goal*.
         #
@@ -467,17 +497,23 @@ class PickPlaceEnv(gym.Env):
         # a second, which a thrown object cannot do.
         # `_ever_grasped` is part of the criterion so that knocking the box
         # to the goal can never count, however gently it lands.
-        settled = at_goal and speed < SUCCESS_MAX_SPEED and self._ever_grasped
+        settled = (
+            self._dist_box_goal() < SUCCESS_RADIUS
+            and self._box_speed() < SUCCESS_MAX_SPEED
+            and self._ever_grasped
+        )
         self._success_streak = self._success_streak + 1 if settled else 0
+        return grasped, settled
+
+    def _reward(self, action: np.ndarray):
+        grasped, settled = self._update_task_state()
         success = self._success_streak >= SUCCESS_HOLD_STEPS
 
         if self.reward_type == "sparse":
             return (0.0 if success else -1.0), success
 
-        # Instantaneous contact -> persistent grasp.
-        self._grasp_streak = self._grasp_streak + 1 if self.is_grasped() else 0
-        grasped = self.has_stable_grasp()
-
+        d_place = self._dist_box_goal()
+        speed = self._box_speed()
         box_z = self._box_pos()[2]
         reach_pot = -self._dist_grip_box()
         place_pot = -d_place
@@ -494,8 +530,6 @@ class PickPlaceEnv(gym.Env):
             if not self._gave_lift_bonus and box_z > LIFT_Z:
                 r += 3.0
                 self._gave_lift_bonus = True
-            self._peak_box_z = max(self._peak_box_z, box_z)
-            self._ever_grasped = True
         else:
             r += 10.0 * (reach_pot - self._prev_reach_pot)
             if self._had_grasp and box_z < LIFT_Z:
