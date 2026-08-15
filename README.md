@@ -81,7 +81,7 @@ times instead of seeing it once and forgetting.
 - **Domain randomization** — every episode, the arm's damping, mass, gearing
   and inertia get jittered. A policy that only works in one exact simulated
   world isn't much of a robot learning story.
-- **20 passing tests**, including hand-derived inverse kinematics checked
+- **24 passing tests**, including hand-derived inverse kinematics checked
   against MuJoCo's own forward kinematics, and a scripted controller that
   solves pick-and-place 100% of the time. That last one is load-bearing: it
   proves the task is *possible* before I'm allowed to blame the RL for
@@ -301,6 +301,74 @@ exactly the same thing if the per-step action limit is set too large.
 
 ---
 
+## Behaviour cloning: a wrong prediction, and a better result
+
+Phase 5 opens with the cheapest possible imitation-learning baseline: fit a
+small network directly to the scripted controller's `(observation, action)`
+pairs, no reward function involved at all, and see how far pure supervised
+cloning gets before reaching for sparse-reward RL + Hindsight Experience
+Replay.
+
+**The demonstrations.** `scripts/scripted_pick_place.py --save-demos`, run at
+`difficulty=1.0` — the widest sampling range, which nests the narrower ranges
+used at lower difficulties — for 300 episodes: 100% scripted success, 28,783
+`(observation, action)` transitions saved. Only successful episodes are ever
+written to the demo file, so this is clean expert data with no failed
+rollouts mixed in.
+
+**The policy.** A `[64, 64]` MLP with Tanh activations — matching Stable-
+Baselines3's default PPO architecture — trained with plain MSE regression
+against the demo actions, early-stopped on a held-out split around epoch 140
+(val MSE 0.017).
+
+**The prediction, stated before running the sweep:** BC should do well close
+to the training distribution and degrade as task difficulty rises, because
+the scripted controller is deterministic and only ever demonstrates one thin
+manifold of trajectories through state space — the moment a cloned policy
+drifts even slightly off that manifold under its own closed-loop rollout,
+there's no data telling it how to recover. Textbook compounding error.
+
+**What actually happened**, aggregated over 5 seeds × 40 episodes per
+difficulty (200 rollouts per row, re-run after an initial 30-episode pass
+gave two different, contradictory pictures — not enough signal to trust):
+
+| difficulty | grasp | lift | success | mean return |
+|---|---|---|---|---|
+| 0.00 | 75% ± 9% | 75% ± 9% | **31%** ± 7% | 8.68 |
+| 0.50 | 78% ± 6% | 78% ± 6% | **38%** ± 7% | 11.15 |
+| 1.00 | 76% ± 5% | 76% ± 6% | **48%** ± 10% | 13.15 |
+
+Success rate *rises* with difficulty. The prediction was backwards.
+
+**Why — and this is the actual finding, not just a contradicted hypothesis.**
+Grasp and lift are flat and statistically identical at every difficulty:
+once BC establishes a stable grasp it reliably continues lifting the box,
+so that part of the task isn't where it struggles. The entire gap between
+"lifted" (~76%) and "settled at goal" (31–48%) opens up downstream, in
+placement — and it's worst exactly where difficulty is *lowest*, because at
+`difficulty=0.0` the goal sits within 2 cm of the box's starting position: a
+narrow, tightly-clustered target that's a rare corner of the wide
+(`difficulty=1.0`) distribution the demos were actually drawn from. The
+policy has simply seen far less of the fine, small-motion placement behaviour
+that low difficulty demands. Compounding error is still the right frame for
+BC's ceiling — it just compounds against **data density**, not task
+difficulty, and here those two things point in opposite directions.
+
+One more number worth sitting with: the held-out regression loss (0.017 MSE)
+is low and would look like a healthy fit on a slide. It has almost no
+relationship to the 31–48% closed-loop success rate above it. Low open-loop
+prediction error next to mediocre closed-loop task performance is the
+textbook BC failure mode, and it's a better demonstration of *why* that
+failure mode exists than a confirmed prediction would have been.
+
+**Against the PPO baseline** (100% success at every difficulty, mean return
+27.4–27.9): BC tops out at under half of PPO's return and well under half its
+success rate across the whole sweep. That comparison, more than the absolute
+BC numbers, is the actual point of running this baseline — it's the bar
+sparse-reward RL + HER needs to clear to justify the extra machinery.
+
+---
+
 ## Quickstart
 
 ```bash
@@ -309,7 +377,7 @@ cd Robot-Learning-Manipulation
 python -m venv venv && source venv/bin/activate    # Windows: .\venv\Scripts\Activate.ps1
 pip install -r requirements.txt
 
-pytest tests/ -v                                   # 20 tests, ~2 seconds
+pytest tests/ -v                                   # 24 tests, a couple of seconds
 ```
 
 The same 20 tests, plus a scripted-controller sanity check, run on every push
@@ -362,6 +430,21 @@ pinned at a single flat value regardless of difficulty, that specific
 signature means the policy has converged to parking on the box without
 grasping — check `evaluate_pick_place.py --sweep` for a flat return across
 every difficulty row before assuming it's still training.
+
+**Behaviour cloning (Phase 5, part one):**
+
+```bash
+# Generate demonstrations from the scripted controller. Only successful
+# episodes get written, so this is clean expert data.
+python scripts/scripted_pick_place.py --episodes 300 --difficulty 1.0 --save-demos data/demos.npz
+
+# Train, then sweep-evaluate by rollout (not held-out regression loss --
+# closed-loop success is what actually matters, see writeup above).
+python training/train_bc.py --demos data/demos.npz --epochs 150 --checkpoint out/bc_policy.pt
+
+# Re-evaluate an existing checkpoint without retraining:
+python training/train_bc.py --sweep-only --checkpoint out/bc_policy.pt --eval-episodes 40
+```
 
 **Making GIFs:**
 
@@ -432,6 +515,7 @@ training/
   train_ppo.py
   train_sac.py
   train_pick_place.py       # SAC/PPO + automatic curriculum callback
+  train_bc.py               # behaviour cloning baseline (Phase 5, part one)
 scripts/
   scripted_pick_place.py    # IK waypoint controller; also generates BC demos
 evaluation/
@@ -442,9 +526,13 @@ evaluation/
   record_pick_place_gif.py
 domain_randomization/
   randomize.py
+data/
+  demos.npz                 # scripted-controller demonstrations (regenerate via Quickstart; consider .gitignore)
+out/
+  bc_policy.pt              # trained BC checkpoint (regenerate via Quickstart; consider .gitignore)
 tests/
   test_env.py               # 7 tests -- reach
-  test_pick_place_env.py    # 13 tests -- pick-and-place
+  test_pick_place_env.py    # 17 tests -- pick-and-place, incl. sparse reward-mode parity
 docs/
   topics_covered.md         # concept map + Bug 1
   pick_place_notes.md       # the design rationale + Bugs 2 and 3
@@ -461,15 +549,20 @@ results/
 | 2 | RL baseline: reach task | done |
 | 3 | Manipulation: pick-and-place | done |
 | 4 | Robustness: domain randomization | done (reach) |
-| 5 | Imitation learning comparison | next |
+| 5 | Imitation learning comparison | BC baseline done, HER next |
 | 6 | Evaluation, visualization & docs | done |
 
-**Phase 5** is the interesting one and it's now unblocked, because the scripted
-controller can generate demonstrations (`--save-demos`). The plan is behaviour
-cloning vs. SAC vs. BC-pretrained-then-SAC on identical budgets, plus a
-sparse-reward + Hindsight Experience Replay variant (already wired up via
-`reward_type="sparse"`) to test whether hindsight relabelling can recover what
-hand-designed reward staging buys you.
+**Phase 5, part one (behaviour cloning) is done** — see the writeup above.
+It predicted the wrong failure mode, and that turned out to be more useful
+than a confirmed prediction: BC's ceiling tracks demonstration data density,
+not task difficulty. **Part two** is a sparse-reward + Hindsight Experience
+Replay variant (`reward_type="sparse"` is already wired up and covered by
+its own parity tests against the dense reward) to test whether goal
+relabelling can recover what hand-designed reward staging bought Task 2 for
+free. The open question there: the current success criterion depends on
+grasp state and box speed, not just goal position, and HER's reward-from-
+goal-pair convention doesn't naturally express that — so part of the work
+is deciding what the goal vector should even be before any training runs.
 
 ---
 
